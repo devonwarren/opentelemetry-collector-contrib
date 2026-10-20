@@ -285,8 +285,6 @@ func mergeExponentialHistogramDataPoints(dpsMap map[string]pmetric.ExponentialHi
 	for _, dps := range dpsMap {
 		dp := to.AppendEmpty()
 		dps.At(0).MoveTo(dp)
-		negatives := dp.Negative().BucketCounts()
-		positives := dp.Positive().BucketCounts()
 		for i := 1; i < dps.Len(); i++ {
 			if dps.At(i).Count() == 0 {
 				continue
@@ -308,8 +306,7 @@ func mergeExponentialHistogramDataPoints(dpsMap map[string]pmetric.ExponentialHi
 				dp.SetMax(dps.At(i).Max())
 			}
 
-			dp.Negative().SetOffset(mergeExponentialHistogramBuckets(negatives, dps.At(i).Negative().BucketCounts(), dp.Negative().Offset(), dps.At(i).Negative().Offset()))
-			dp.Positive().SetOffset(mergeExponentialHistogramBuckets(positives, dps.At(i).Positive().BucketCounts(), dp.Positive().Offset(), dps.At(i).Positive().Offset()))
+			mergeExponentialHistogramBuckets(dp, dps.At(i))
 
 			dps.At(i).Exemplars().MoveAndAppendTo(dp.Exemplars())
 			if dps.At(i).StartTimestamp() < dp.StartTimestamp() {
@@ -319,37 +316,97 @@ func mergeExponentialHistogramDataPoints(dpsMap map[string]pmetric.ExponentialHi
 	}
 }
 
-// mergeExponentialHistogramBuckets adds the src buckets into tgt, aligning them
-// by absolute bucket index, and returns the offset of the merged buckets.
-func mergeExponentialHistogramBuckets(tgt, src pcommon.UInt64Slice, tgtOff, srcOff int32) int32 {
-	if src.Len() == 0 {
-		return tgtOff
-	}
-	if tgt.Len() == 0 {
-		src.CopyTo(tgt)
-		return srcOff
-	}
+const (
+	// defaultMaxExpHistogramBuckets matches the OTel SDK default max_size.
+	defaultMaxExpHistogramBuckets = 160
+	minExpHistogramScale          = -10
+)
 
-	newOff := min(tgtOff, srcOff)
+// expBuckets is one side (positive or negative) of an exponential histogram.
+type expBuckets struct {
+	offset int64
+	counts []uint64
+}
 
-	// Shift the target right so that index 0 corresponds to newOff
-	if shift := int(tgtOff - newOff); shift > 0 {
-		shifted := make([]uint64, tgt.Len()+shift)
-		for b := 0; b < tgt.Len(); b++ {
-			shifted[b+shift] = tgt.At(b)
+func newExpBuckets(b pmetric.ExponentialHistogramDataPointBuckets) expBuckets {
+	return expBuckets{offset: int64(b.Offset()), counts: b.BucketCounts().AsRaw()}
+}
+
+// bounds returns the first and last bucket index after downscaling by k.
+func (b expBuckets) bounds(k int32) (lo, hi int64) {
+	return b.offset >> k, (b.offset + int64(len(b.counts)) - 1) >> k
+}
+
+// downscale lowers the scale by k, merging 2^k adjacent buckets into one.
+func (b expBuckets) downscale(k int32) expBuckets {
+	if k == 0 || len(b.counts) == 0 {
+		return b
+	}
+	lo, hi := b.bounds(k)
+	counts := make([]uint64, hi-lo+1)
+	for i, c := range b.counts {
+		counts[((b.offset+int64(i))>>k)-lo] += c
+	}
+	return expBuckets{offset: lo, counts: counts}
+}
+
+// mergedSpan is the merged bucket count after downscaling by k.
+func mergedSpan(a, b expBuckets, k int32) int64 {
+	switch {
+	case len(a.counts) == 0 && len(b.counts) == 0:
+		return 0
+	case len(a.counts) == 0:
+		a = b
+	case len(b.counts) == 0:
+		b = a
+	}
+	aLo, aHi := a.bounds(k)
+	bLo, bHi := b.bounds(k)
+	return max(aHi, bHi) - min(aLo, bLo) + 1
+}
+
+// mergeBuckets sums a and b, which share a scale, by bucket index.
+func mergeBuckets(a, b expBuckets) expBuckets {
+	if len(b.counts) == 0 {
+		return a
+	}
+	if len(a.counts) == 0 {
+		return b
+	}
+	lo := min(a.offset, b.offset)
+	hi := max(a.offset+int64(len(a.counts)), b.offset+int64(len(b.counts)))
+	counts := make([]uint64, hi-lo)
+	for _, s := range []expBuckets{a, b} {
+		for i, c := range s.counts {
+			counts[s.offset-lo+int64(i)] += c
 		}
-		tgt.FromRaw(shifted)
+	}
+	return expBuckets{offset: lo, counts: counts}
+}
+
+// mergeExponentialHistogramBuckets merges src's buckets into dp at a common scale.
+// It downscales further when the buckets would exceed the size limit.
+func mergeExponentialHistogramBuckets(dp, src pmetric.ExponentialHistogramDataPoint) {
+	scale := min(dp.Scale(), src.Scale())
+	dpPos := newExpBuckets(dp.Positive()).downscale(dp.Scale() - scale)
+	dpNeg := newExpBuckets(dp.Negative()).downscale(dp.Scale() - scale)
+	srcPos := newExpBuckets(src.Positive()).downscale(src.Scale() - scale)
+	srcNeg := newExpBuckets(src.Negative()).downscale(src.Scale() - scale)
+
+	limit := int64(max(defaultMaxExpHistogramBuckets, len(dpPos.counts), len(dpNeg.counts), len(srcPos.counts), len(srcNeg.counts)))
+	var k int32
+	for scale-k > minExpHistogramScale && (mergedSpan(dpPos, srcPos, k) > limit || mergedSpan(dpNeg, srcNeg, k) > limit) {
+		k++
 	}
 
-	start := int(srcOff - newOff)
-	for b := 0; b < src.Len(); b++ {
-		idx := start + b
-		for tgt.Len() <= idx {
-			tgt.Append(0)
-		}
-		tgt.SetAt(idx, tgt.At(idx)+src.At(b))
-	}
-	return newOff
+	pos := mergeBuckets(dpPos.downscale(k), srcPos.downscale(k))
+	neg := mergeBuckets(dpNeg.downscale(k), srcNeg.downscale(k))
+
+	dp.SetScale(scale - k)
+	dp.Positive().SetOffset(int32(pos.offset))
+	dp.Positive().BucketCounts().FromRaw(pos.counts)
+	dp.Negative().SetOffset(int32(neg.offset))
+	dp.Negative().BucketCounts().FromRaw(neg.counts)
 }
 
 func groupNumberDataPoints(dps pmetric.NumberDataPointSlice, useStartTime bool,

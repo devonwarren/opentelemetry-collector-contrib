@@ -732,59 +732,95 @@ func testDataExpHistogramWithDifferentOffsets() pmetric.ExponentialHistogramData
 }
 
 func Test_mergeExponentialHistogramBuckets(t *testing.T) {
+	type side struct {
+		scale  int32
+		offset int32
+		counts []uint64
+	}
+	gap := func(n int, first, last uint64) []uint64 {
+		c := make([]uint64, n)
+		c[0], c[n-1] = first, last
+		return c
+	}
 	tests := []struct {
-		name    string
-		tgt     []uint64
-		tgtOff  int32
-		src     []uint64
-		srcOff  int32
-		want    []uint64
-		wantOff int32
+		name string
+		tgt  side
+		src  side
+		want side
 	}{
 		{
-			name: "same offset", tgt: []uint64{1, 2}, tgtOff: 3, src: []uint64{3, 4, 5}, srcOff: 3,
-			want: []uint64{4, 6, 5}, wantOff: 3,
+			name: "same offset",
+			tgt:  side{0, 3, []uint64{1, 2}}, src: side{0, 3, []uint64{3, 4, 5}},
+			want: side{0, 3, []uint64{4, 6, 5}},
 		},
 		{
-			name: "source offset higher", tgt: []uint64{1, 2}, tgtOff: 0, src: []uint64{3, 4}, srcOff: 1,
-			want: []uint64{1, 5, 4}, wantOff: 0,
+			name: "source offset higher",
+			tgt:  side{0, 0, []uint64{1, 2}}, src: side{0, 1, []uint64{3, 4}},
+			want: side{0, 0, []uint64{1, 5, 4}},
 		},
 		{
-			name: "source offset lower with a gap", tgt: []uint64{10}, tgtOff: 5, src: []uint64{1}, srcOff: 3,
-			want: []uint64{1, 0, 10}, wantOff: 3,
+			name: "source offset lower with a gap",
+			tgt:  side{0, 5, []uint64{10}}, src: side{0, 3, []uint64{1}},
+			want: side{0, 3, []uint64{1, 0, 10}},
 		},
 		{
-			name: "source offset lower and overlapping", tgt: []uint64{10, 20}, tgtOff: 5, src: []uint64{1, 2}, srcOff: 4,
-			want: []uint64{1, 12, 20}, wantOff: 4,
+			name: "source offset lower and overlapping",
+			tgt:  side{0, 5, []uint64{10, 20}}, src: side{0, 4, []uint64{1, 2}},
+			want: side{0, 4, []uint64{1, 12, 20}},
 		},
 		{
-			name: "source offset lower with zero buckets", tgt: []uint64{10}, tgtOff: 5, src: []uint64{1, 0, 2}, srcOff: 3,
-			want: []uint64{1, 0, 12}, wantOff: 3,
+			name: "source offset lower with zero buckets",
+			tgt:  side{0, 5, []uint64{10}}, src: side{0, 3, []uint64{1, 0, 2}},
+			want: side{0, 3, []uint64{1, 0, 12}},
 		},
 		{
-			name: "source offset lower with a leading zero bucket", tgt: []uint64{10}, tgtOff: 5, src: []uint64{0, 1}, srcOff: 2,
-			want: []uint64{0, 1, 0, 10}, wantOff: 2,
+			name: "leading zero bucket is kept",
+			tgt:  side{0, 5, []uint64{10}}, src: side{0, 2, []uint64{0, 1}},
+			want: side{0, 2, []uint64{0, 1, 0, 10}},
 		},
 		{
-			name: "empty source keeps target", tgt: []uint64{1}, tgtOff: 5, src: []uint64{}, srcOff: 0,
-			want: []uint64{1}, wantOff: 5,
+			name: "empty source keeps target",
+			tgt:  side{0, 5, []uint64{1}}, src: side{0, 0, []uint64{}},
+			want: side{0, 5, []uint64{1}},
 		},
 		{
-			name: "empty target takes source", tgt: []uint64{}, tgtOff: 0, src: []uint64{1, 2}, srcOff: 7,
-			want: []uint64{1, 2}, wantOff: 7,
+			name: "empty target takes source",
+			tgt:  side{0, 0, []uint64{}}, src: side{0, 7, []uint64{1, 2}},
+			want: side{0, 7, []uint64{1, 2}},
+		},
+		{
+			name: "different scales merge at the lower one",
+			tgt:  side{2, 4, []uint64{1, 1}}, src: side{1, 2, []uint64{3}},
+			want: side{1, 2, []uint64{5}},
+		},
+		{
+			name: "large gap downscales to the max size",
+			tgt:  side{20, 0, []uint64{1}}, src: side{20, 1_000_000, []uint64{1}},
+			want: side{7, 0, gap(123, 1, 1)},
+		},
+		{
+			name: "offsets more than 2^31 apart",
+			tgt:  side{20, 1 << 30, []uint64{1}}, src: side{20, -(1 << 30) - 1, []uint64{1}},
+			want: side{-4, -65, gap(130, 1, 1)},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tgt := pcommon.NewUInt64Slice()
-			tgt.FromRaw(tt.tgt)
-			src := pcommon.NewUInt64Slice()
-			src.FromRaw(tt.src)
+			point := func(s side) pmetric.ExponentialHistogramDataPoint {
+				dp := pmetric.NewExponentialHistogramDataPoint()
+				dp.SetScale(s.scale)
+				dp.Positive().SetOffset(s.offset)
+				dp.Positive().BucketCounts().FromRaw(s.counts)
+				return dp
+			}
+			dp := point(tt.tgt)
 
-			gotOff := mergeExponentialHistogramBuckets(tgt, src, tt.tgtOff, tt.srcOff)
+			mergeExponentialHistogramBuckets(dp, point(tt.src))
 
-			require.Equal(t, tt.wantOff, gotOff)
-			require.Equal(t, tt.want, tgt.AsRaw())
+			require.Equal(t, tt.want.scale, dp.Scale())
+			require.Equal(t, tt.want.offset, dp.Positive().Offset())
+			require.Equal(t, tt.want.counts, dp.Positive().BucketCounts().AsRaw())
+			require.Zero(t, dp.Negative().BucketCounts().Len())
 		})
 	}
 }
