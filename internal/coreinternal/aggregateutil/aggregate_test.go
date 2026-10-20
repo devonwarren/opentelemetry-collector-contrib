@@ -730,3 +730,99 @@ func testDataExpHistogramWithDifferentOffsets() pmetric.ExponentialHistogramData
 
 	return dataWant
 }
+
+func Test_mergeExponentialHistogramBuckets(t *testing.T) {
+	tests := []struct {
+		name    string
+		tgt     []uint64
+		tgtOff  int32
+		src     []uint64
+		srcOff  int32
+		want    []uint64
+		wantOff int32
+	}{
+		{
+			name: "same offset", tgt: []uint64{1, 2}, tgtOff: 3, src: []uint64{3, 4, 5}, srcOff: 3,
+			want: []uint64{4, 6, 5}, wantOff: 3,
+		},
+		{
+			name: "source offset higher", tgt: []uint64{1, 2}, tgtOff: 0, src: []uint64{3, 4}, srcOff: 1,
+			want: []uint64{1, 5, 4}, wantOff: 0,
+		},
+		{
+			name: "source offset lower with a gap", tgt: []uint64{10}, tgtOff: 5, src: []uint64{1}, srcOff: 3,
+			want: []uint64{1, 0, 10}, wantOff: 3,
+		},
+		{
+			name: "source offset lower and overlapping", tgt: []uint64{10, 20}, tgtOff: 5, src: []uint64{1, 2}, srcOff: 4,
+			want: []uint64{1, 12, 20}, wantOff: 4,
+		},
+		{
+			name: "source offset lower with zero buckets", tgt: []uint64{10}, tgtOff: 5, src: []uint64{1, 0, 2}, srcOff: 3,
+			want: []uint64{1, 0, 12}, wantOff: 3,
+		},
+		{
+			name: "source offset lower with a leading zero bucket", tgt: []uint64{10}, tgtOff: 5, src: []uint64{0, 1}, srcOff: 2,
+			want: []uint64{0, 1, 0, 10}, wantOff: 2,
+		},
+		{
+			name: "empty source keeps target", tgt: []uint64{1}, tgtOff: 5, src: []uint64{}, srcOff: 0,
+			want: []uint64{1}, wantOff: 5,
+		},
+		{
+			name: "empty target takes source", tgt: []uint64{}, tgtOff: 0, src: []uint64{1, 2}, srcOff: 7,
+			want: []uint64{1, 2}, wantOff: 7,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tgt := pcommon.NewUInt64Slice()
+			tgt.FromRaw(tt.tgt)
+			src := pcommon.NewUInt64Slice()
+			src.FromRaw(tt.src)
+
+			gotOff := mergeExponentialHistogramBuckets(tgt, src, tt.tgtOff, tt.srcOff)
+
+			require.Equal(t, tt.wantOff, gotOff)
+			require.Equal(t, tt.want, tgt.AsRaw())
+		})
+	}
+}
+
+func Test_MergeDataPoints_ExpHistogramOrderIndependent(t *testing.T) {
+	mapAttr := pcommon.NewMap()
+	mapAttr.PutStr("attr1", "val1")
+	hash := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), 0, false, false, 0)
+
+	points := func(offsets []int32, buckets [][]uint64) pmetric.ExponentialHistogramDataPointSlice {
+		s := pmetric.NewExponentialHistogramDataPointSlice()
+		for i := range offsets {
+			d := s.AppendEmpty()
+			d.Attributes().PutStr("attr1", "val1")
+			var count uint64
+			for _, c := range buckets[i] {
+				count += c
+			}
+			d.SetCount(count)
+			d.Positive().SetOffset(offsets[i])
+			d.Positive().BucketCounts().FromRaw(buckets[i])
+		}
+		return s
+	}
+
+	merge := func(dps pmetric.ExponentialHistogramDataPointSlice) pmetric.ExponentialHistogramDataPoint {
+		m := pmetric.NewMetric()
+		m.SetEmptyExponentialHistogram()
+		MergeDataPoints(m, Sum, AggGroups{expHistogram: map[string]pmetric.ExponentialHistogramDataPointSlice{hash: dps}})
+		return m.ExponentialHistogram().DataPoints().At(0)
+	}
+
+	forward := merge(points([]int32{5, 3, 4}, [][]uint64{{10, 20}, {1, 0, 2}, {3}}))
+	reverse := merge(points([]int32{4, 3, 5}, [][]uint64{{3}, {1, 0, 2}, {10, 20}}))
+
+	for _, dp := range []pmetric.ExponentialHistogramDataPoint{forward, reverse} {
+		require.Equal(t, int32(3), dp.Positive().Offset())
+		require.Equal(t, []uint64{1, 3, 12, 20}, dp.Positive().BucketCounts().AsRaw())
+		require.Equal(t, uint64(36), dp.Count())
+	}
+}

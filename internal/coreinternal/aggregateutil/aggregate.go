@@ -308,22 +308,8 @@ func mergeExponentialHistogramDataPoints(dpsMap map[string]pmetric.ExponentialHi
 				dp.SetMax(dps.At(i).Max())
 			}
 
-			// Check if offsets are different, indicating we need to adjust dp offsets and bucket counts after merging
-			negOffsetDiff := dp.Negative().Offset() != dps.At(i).Negative().Offset()
-			posOffsetDiff := dp.Positive().Offset() != dps.At(i).Positive().Offset()
-
-			mergeExponentialHistogramBuckets(negatives, dps.At(i).Negative().BucketCounts(), dp.Negative().Offset(), dps.At(i).Negative().Offset())
-			mergeExponentialHistogramBuckets(positives, dps.At(i).Positive().BucketCounts(), dp.Positive().Offset(), dps.At(i).Positive().Offset())
-
-			// Only adjust offsets and remove leading zero buckets if we had different offsets and the buckets are not empty
-			if negOffsetDiff && dps.At(i).Negative().BucketCounts().Len() != 0 {
-				dp.Negative().SetOffset(min(dp.Negative().Offset(), dps.At(i).Negative().Offset()))
-				trimBuckets(negatives)
-			}
-			if posOffsetDiff && dps.At(i).Positive().BucketCounts().Len() != 0 {
-				dp.Positive().SetOffset(min(dp.Positive().Offset(), dps.At(i).Positive().Offset()))
-				trimBuckets(positives)
-			}
+			dp.Negative().SetOffset(mergeExponentialHistogramBuckets(negatives, dps.At(i).Negative().BucketCounts(), dp.Negative().Offset(), dps.At(i).Negative().Offset()))
+			dp.Positive().SetOffset(mergeExponentialHistogramBuckets(positives, dps.At(i).Positive().BucketCounts(), dp.Positive().Offset(), dps.At(i).Positive().Offset()))
 
 			dps.At(i).Exemplars().MoveAndAppendTo(dp.Exemplars())
 			if dps.At(i).StartTimestamp() < dp.StartTimestamp() {
@@ -333,70 +319,37 @@ func mergeExponentialHistogramDataPoints(dpsMap map[string]pmetric.ExponentialHi
 	}
 }
 
-func mergeExponentialHistogramBuckets(tgt, src pcommon.UInt64Slice, tgtOff, srcOff int32) {
-	// Both data points have the same offset - simple element-wise addition
-	if tgtOff == srcOff {
-		for b := 0; b < src.Len(); b++ {
-			if b < tgt.Len() {
-				tgt.SetAt(b, tgt.At(b)+src.At(b))
-			} else {
-				tgt.Append(src.At(b))
-			}
-		}
-		return
+// mergeExponentialHistogramBuckets adds the src buckets into tgt, aligning them
+// by absolute bucket index, and returns the offset of the merged buckets.
+func mergeExponentialHistogramBuckets(tgt, src pcommon.UInt64Slice, tgtOff, srcOff int32) int32 {
+	if src.Len() == 0 {
+		return tgtOff
+	}
+	if tgt.Len() == 0 {
+		src.CopyTo(tgt)
+		return srcOff
 	}
 
-	// Source offset is less than target offset - source data point covers lower values
-	if srcOff < tgtOff {
-		for b := src.Len() - 1; b >= 0; b-- {
-			count := src.At(b)
-			if count > 0 {
-				tgt.Append(0)
-				for i := tgt.Len() - 1; i > 0; i-- {
-					tgt.SetAt(i, tgt.At(i-1))
-				}
-				tgt.SetAt(0, count)
-			}
+	newOff := min(tgtOff, srcOff)
+
+	// Shift the target right so that index 0 corresponds to newOff
+	if shift := int(tgtOff - newOff); shift > 0 {
+		shifted := make([]uint64, tgt.Len()+shift)
+		for b := 0; b < tgt.Len(); b++ {
+			shifted[b+shift] = tgt.At(b)
 		}
-		return
+		tgt.FromRaw(shifted)
 	}
 
-	// Source offset is greater than target offset - source data point covers higher values
+	start := int(srcOff - newOff)
 	for b := 0; b < src.Len(); b++ {
-		count := src.At(b)
-		if count == 0 {
-			continue
+		idx := start + b
+		for tgt.Len() <= idx {
+			tgt.Append(0)
 		}
-
-		idx := b + int(srcOff-tgtOff)
-		if idx >= 0 {
-			if idx < tgt.Len() {
-				tgt.SetAt(idx, tgt.At(idx)+count)
-			} else {
-				for tgt.Len() <= idx {
-					tgt.Append(0)
-				}
-				tgt.SetAt(idx, tgt.At(idx)+count)
-			}
-		}
+		tgt.SetAt(idx, tgt.At(idx)+src.At(b))
 	}
-}
-
-func trimBuckets(buckets pcommon.UInt64Slice) {
-	zeroCount := 0
-	for i := 0; i < buckets.Len() && buckets.At(i) == 0; i++ {
-		zeroCount++
-	}
-
-	if zeroCount == 0 {
-		return
-	}
-
-	newBuckets := make([]uint64, buckets.Len()-zeroCount)
-	for i := zeroCount; i < buckets.Len(); i++ {
-		newBuckets[i-zeroCount] = buckets.At(i)
-	}
-	buckets.FromRaw(newBuckets)
+	return newOff
 }
 
 func groupNumberDataPoints(dps pmetric.NumberDataPointSlice, useStartTime bool,
