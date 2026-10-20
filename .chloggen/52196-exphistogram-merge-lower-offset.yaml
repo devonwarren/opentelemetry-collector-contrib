@@ -7,7 +7,7 @@ change_type: bug_fix
 component: processor/transform
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: Fix exponential histogram buckets being misplaced when aggregating data points whose bucket offsets differ
+note: Fix exponential histogram aggregation misplacing buckets when offsets differ, and merge data points with different scales instead of emitting one per scale
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 issues: [52196]

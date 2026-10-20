@@ -452,8 +452,9 @@ func groupExponentialHistogramDataPoints(dps pmetric.ExponentialHistogramDataPoi
 ) {
 	for i := 0; i < dps.Len(); i++ {
 		dp := dps.At(i)
+		// Scale is left out: the merge downscales points to a common scale
 		keyHashParts := make([]any, 0, 4)
-		keyHashParts = append(keyHashParts, dp.Scale(), dp.HasMin(), dp.HasMax(), uint32(dp.Flags()))
+		keyHashParts = append(keyHashParts, dp.HasMin(), dp.HasMax(), uint32(dp.Flags()))
 		if useStartTime {
 			keyHashParts = append(keyHashParts, dp.StartTimestamp().String())
 		}

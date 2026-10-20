@@ -276,7 +276,7 @@ func Test_GroupDataPoints(t *testing.T) {
 
 	hashHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), false, false, 0)
 
-	hashExpHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), 0, false, false, 0)
+	hashExpHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), false, false, 0)
 
 	tests := []struct {
 		name     string
@@ -396,7 +396,7 @@ func Test_MergeDataPoints(t *testing.T) {
 
 	hashHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), false, false, 0)
 
-	hashExpHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), 0, false, false, 0)
+	hashExpHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), false, false, 0)
 
 	tests := []struct {
 		name     string
@@ -553,7 +553,7 @@ func Test_MergeDataPoints_SumPresence(t *testing.T) {
 	mapAttr := pcommon.NewMap()
 	mapAttr.PutStr("attr1", "val1")
 	hashHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), false, false, 0)
-	hashExpHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), 0, false, false, 0)
+	hashExpHistogram := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), false, false, 0)
 
 	histogramPair := func(setSum0, setSum1 bool) pmetric.HistogramDataPointSlice {
 		s := pmetric.NewHistogramDataPointSlice()
@@ -828,7 +828,7 @@ func Test_mergeExponentialHistogramBuckets(t *testing.T) {
 func Test_MergeDataPoints_ExpHistogramOrderIndependent(t *testing.T) {
 	mapAttr := pcommon.NewMap()
 	mapAttr.PutStr("attr1", "val1")
-	hash := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), 0, false, false, 0)
+	hash := dataPointHashKey(mapAttr, pcommon.NewTimestampFromTime(time.Time{}), false, false, 0)
 
 	points := func(offsets []int32, buckets [][]uint64) pmetric.ExponentialHistogramDataPointSlice {
 		s := pmetric.NewExponentialHistogramDataPointSlice()
@@ -861,4 +861,38 @@ func Test_MergeDataPoints_ExpHistogramOrderIndependent(t *testing.T) {
 		require.Equal(t, []uint64{1, 3, 12, 20}, dp.Positive().BucketCounts().AsRaw())
 		require.Equal(t, uint64(36), dp.Count())
 	}
+}
+
+func Test_MergeDataPoints_ExpHistogramDifferentScales(t *testing.T) {
+	in := pmetric.NewMetric()
+	dps := in.SetEmptyExponentialHistogram().DataPoints()
+	for _, p := range []struct {
+		scale  int32
+		offset int32
+		counts []uint64
+	}{
+		{scale: 3, offset: 8, counts: []uint64{1, 1}},
+		{scale: 2, offset: 4, counts: []uint64{3}},
+	} {
+		dp := dps.AppendEmpty()
+		dp.Attributes().PutStr("attr1", "val1")
+		dp.SetScale(p.scale)
+		dp.SetCount(p.counts[0] + uint64(len(p.counts)-1))
+		dp.Positive().SetOffset(p.offset)
+		dp.Positive().BucketCounts().FromRaw(p.counts)
+	}
+
+	ag := AggGroups{}
+	GroupDataPoints(in, &ag)
+	out := pmetric.NewMetric()
+	out.SetEmptyExponentialHistogram()
+	MergeDataPoints(out, Sum, ag)
+
+	// one point, so a backend keeping one point per series loses nothing
+	require.Equal(t, 1, out.ExponentialHistogram().DataPoints().Len())
+	dp := out.ExponentialHistogram().DataPoints().At(0)
+	require.Equal(t, int32(2), dp.Scale())
+	require.Equal(t, int32(4), dp.Positive().Offset())
+	require.Equal(t, []uint64{5}, dp.Positive().BucketCounts().AsRaw())
+	require.Equal(t, uint64(5), dp.Count())
 }
